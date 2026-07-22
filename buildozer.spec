@@ -1,5 +1,6 @@
 [app]
-title = 瑙嗛鍘绘按鍗?package.name = waterremover
+title = WatermarkRemover
+package.name = waterremover
 package.domain = com.xly
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,gif,ttf,mp4
