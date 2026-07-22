@@ -13,7 +13,7 @@ fullscreen = 0
 
 # Android
 android.api = 34
-android.minapi = 21
+android.minapi = 24
 android.sdk = 34
 android.ndk = 27
 android.accept_sdk_license = True
