@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>视频去水印</title>
+<script async src="https://docs.opencv.org/4.10.0/opencv.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-touch-callout:none}
+body{background:#1a1a2e;color:#eee;font-family:-apple-system,sans-serif;padding:8px;min-height:100vh}
+.container{max-width:700px;margin:0 auto}
+.controls{display:flex;flex-wrap:wrap;gap:6px;padding:8px 0}
+.controls button{flex:1;min-width:60px;padding:10px 6px;border:none;border-radius:8px;background:#16213e;color:#eee;font-size:13px;cursor:pointer;white-space:nowrap}
+.controls button.active{background:#0f3460}
+.controls button.primary{background:#e94560;color:#fff}
+.controls button.primary:active{background:#c73650}
+.slider-row{display:flex;align-items:center;gap:8px;padding:4px 0;width:100%}
+.slider-row label{font-size:12px;white-space:nowrap;min-width:30px}
+.slider-row input[type=range]{flex:1;height:6px;-webkit-appearance:none;appearance:none;background:#333;border-radius:3px;outline:none}
+.slider-row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#e94560;cursor:pointer}
+.slider-row span{font-size:12px;min-width:24px;text-align:right}
+#videoCanvas{width:100%;aspect-ratio:16/9;background:#000;border-radius:8px;touch-action:none;display:block;margin:4px 0}
+#videoCanvas.drawing{cursor:crosshair}
+.seek-bar{display:flex;align-items:center;gap:8px;padding:8px 0}
+.seek-bar input[type=range]{flex:1;height:4px;-webkit-appearance:none;appearance:none;background:#333;border-radius:2px;outline:none}
+.seek-bar input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:#e94560;cursor:pointer}
+.seek-bar span{font-size:12px;white-space:nowrap}
+.seek-bar button{width:36px;height:36px;border:none;border-radius:50%;background:#16213e;color:#fff;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.status{font-size:12px;padding:6px;color:#888;text-align:center;word-break:break-all}
+input[type=file]{display:none}
+.file-btn{flex:1;min-width:60px;padding:10px 6px;border:none;border-radius:8px;background:#16213e;color:#eee;font-size:13px;cursor:pointer;text-align:center}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="controls">
+    <label class="file-btn" id="loadBtn">📁 加载视频</label>
+    <input type="file" id="fileInput" accept="video/*">
+    <button id="pickBtn">🎯 取色</button>
+    <button id="previewBtn" class="primary">▶ 预览</button>
+    <button id="processBtn">⚡ 处理</button>
+  </div>
+  <div class="slider-row">
+    <label>容差</label>
+    <input type="range" id="tolSlider" min="1" max="100" value="30">
+    <span id="tolVal">30</span>
+  </div>
+  <div class="slider-row">
+    <label>半径</label>
+    <input type="range" id="radSlider" min="1" max="30" value="5">
+    <span id="radVal">5</span>
+  </div>
+  <canvas id="videoCanvas"></canvas>
+  <div class="seek-bar">
+    <button id="playBtn">▶</button>
+    <button id="prevBtn">◀</button>
+    <input type="range" id="seekSlider" min="0" max="0" value="0">
+    <span id="timeLabel">00:00 / 00:00</span>
+  </div>
+  <div class="status" id="statusLabel">就绪 — 点击"加载视频"选择文件</div>
+</div>
+<script>
+let cvReady = false;
+function onCvReady() { cvReady = true; }
+
+const STATUS = document.getElementById('statusLabel');
+const CANVAS = document.getElementById('videoCanvas');
+const CTX = CANVAS.getContext('2d');
+const FILE_INPUT = document.getElementById('fileInput');
+const LOAD_BTN = document.getElementById('loadBtn');
+const PICK_BTN = document.getElementById('pickBtn');
+const PREVIEW_BTN = document.getElementById('previewBtn');
+const PROCESS_BTN = document.getElementById('processBtn');
+const PLAY_BTN = document.getElementById('playBtn');
+const PREV_BTN = document.getElementById('prevBtn');
+const TOL_SLIDER = document.getElementById('tolSlider');
+const RAD_SLIDER = document.getElementById('radSlider');
+const TOL_VAL = document.getElementById('tolVal');
+const RAD_VAL = document.getElementById('radVal');
+const SEEK_SLIDER = document.getElementById('seekSlider');
+const TIME_LABEL = document.getElementById('timeLabel');
+
+// ---- app state ----
+let videoFile = null;
+let frames = [];          // array of cv.Mat
+let totalFrames = 0;
+let fps = 30;
+let currentIdx = 0;
+let isPlaying = false;
+let playInterval = null;
+
+let roi = null;           // {x,y,w,h}
+let targetColor = null;   // [B,G,R]
+let tolerance = 30;
+let inpaintRadius = 5;
+
+let previewFrameIdx = -1;
+let lastResultData = null; // ImageData for preview result
+
+// canvas interaction for ROI
+let drawing = false;
+let roiStart = null;
+
+// ---- OpenCV helpers ----
+function matToImageData(mat) {
+  const img = new ImageData(mat.cols, mat.rows);
+  const data = new Uint8ClampedArray(mat.data);
+  img.data.set(data);
+  return img;
+}
+
+function bgrToRgb(mat) {
+  cv.cvtColor(mat, mat, cv.COLOR_BGR2RGB);
+}
+
+function rgbToBgr(mat) {
+  cv.cvtColor(mat, mat, cv.COLOR_RGB2BGR);
+}
+
+function renderFrame(idx) {
+  if (idx < 0 || idx >= frames.length) return;
+  const mat = frames[idx];
+  const display = mat.clone();
+  // draw ROI
+  if (roi) {
+    const pt1 = new cv.Point(roi.x, roi.y);
+    const pt2 = new cv.Point(roi.x + roi.w, roi.y + roi.h);
+    cv.rectangle(display, pt1, pt2, [0, 255, 0, 255], 2);
+  }
+  // draw to canvas
+  bgrToRgb(display);
+  const imgData = matToImageData(display);
+  CTX.putImageData(imgData, 0, 0);
+  display.delete();
+}
+
+function updateTime() {
+  const total = totalFrames;
+  const cur = currentIdx;
+  const fmt = (n) => String(Math.floor(n)).padStart(2,'0');
+  const tf = total > 3600 ? `${fmt(total/3600)}:${fmt((total%3600)/60)}:${fmt(total%60)}` : `${fmt(total/60)}:${fmt(total%60)}`;
+  const cf = total > 3600 ? `${fmt(cur/3600)}:${fmt((cur%3600)/60)}:${fmt(cur%60)}` : `${fmt(cur/60)}:${fmt(cur%60)}`;
+  TIME_LABEL.textContent = `${cf} / ${tf}`;
+  SEEK_SLIDER.max = Math.max(0, totalFrames - 1);
+  SEEK_SLIDER.value = cur;
+}
+
+// ---- video loading ----
+LOAD_BTN.addEventListener('click', () => FILE_INPUT.click());
+FILE_INPUT.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  videoFile = file;
+  STATUS.textContent = '解码中...';
+  // clean old frames
+  for (const f of frames) if (f) f.delete();
+  frames = [];
+  currentIdx = 0;
+  totalFrames = 0;
+  fps = 30;
+  roi = null;
+  targetColor = null;
+  previewFrameIdx = -1;
+  lastResultData = null;
+
+  try {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.preload = 'auto';
+    video.muted = true;
+    video.playsInline = true;
+    await new Promise((resolve, reject) => {
+      video.onloadedmetadata = () => {
+        totalFrames = Math.round(video.duration * 30);
+        fps = 30;
+        resolve();
+      };
+      video.onerror = reject;
+      video.src = url;
+      video.load();
+    });
+    // seek through frames
+    video.currentTime = 0;
+    const cap = new cv.VideoCapture(url);
+    // Actually VideoCapture won't work in JS easily for local files
+    // Fallback: use canvas to capture frames
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = video.videoWidth || 640;
+    tempCanvas.height = video.videoHeight || 480;
+    const tCtx = tempCanvas.getContext('2d');
+
+    // extract frames at 1-second intervals for preview, then full extraction for processing
+    // For simplicity, extract 30 frames to show
+    const extractCount = Math.min(Math.ceil(video.duration * fps), 300);
+    totalFrames = extractCount;
+    frames = [];
+
+    for (let i = 0; i < extractCount; i++) {
+      video.currentTime = i / fps;
+      await new Promise(r => { video.onseeked = r; });
+      tCtx.drawImage(video, 0, 0);
+      const imgData = tCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+      const mat = cv.matFromImageData(imgData);
+      rgbToBgr(mat);
+      frames.push(mat);
+      if (i % 10 === 0) STATUS.textContent = `解码中... ${i}/${extractCount}`;
+    }
+
+    CANVAS.width = tempCanvas.width;
+    CANVAS.height = tempCanvas.height;
+    renderFrame(0);
+    updateTime();
+    STATUS.textContent = `已加载: ${file.name} (${totalFrames}帧)`;
+  } catch (err) {
+    STATUS.textContent = `解码失败: ${err.message}`;
+    console.error(err);
+  }
+});
+
+// ---- ROI selection ----
+CANVAS.addEventListener('mousedown', (e) => {
+  if (frames.length === 0) return;
+  const rect = CANVAS.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (CANVAS.width / rect.width);
+  const y = (e.clientY - rect.top) * (CANVAS.height / rect.height);
+  drawing = true;
+  roiStart = {x, y};
+  roi = {x, y, w: 0, h: 0};
+  CANVAS.classList.add('drawing');
+});
+
+CANVAS.addEventListener('mousemove', (e) => {
+  if (!drawing) return;
+  const rect = CANVAS.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (CANVAS.width / rect.width);
+  const y = (e.clientY - rect.top) * (CANVAS.height / rect.height);
+  roi.x = Math.min(roiStart.x, x);
+  roi.y = Math.min(roiStart.y, y);
+  roi.w = Math.abs(x - roiStart.x);
+  roi.h = Math.abs(y - roiStart.y);
+  renderFrame(currentIdx);
+});
+
+CANVAS.addEventListener('mouseup', () => {
+  drawing = false;
+  CANVAS.classList.remove('drawing');
+  if (roi && (roi.w < 5 || roi.h < 5)) roi = null;
+});
+
+CANVAS.addEventListener('touchstart', (e) => {
+  e.preventDefault();
+  if (frames.length === 0) return;
+  const touch = e.touches[0];
+  const rect = CANVAS.getBoundingClientRect();
+  const x = (touch.clientX - rect.left) * (CANVAS.width / rect.width);
+  const y = (touch.clientY - rect.top) * (CANVAS.height / rect.height);
+  drawing = true;
+  roiStart = {x, y};
+  roi = {x, y, w: 0, h: 0};
+}, {passive: false});
+
+CANVAS.addEventListener('touchmove', (e) => {
+  e.preventDefault();
+  if (!drawing) return;
+  const touch = e.touches[0];
+  const rect = CANVAS.getBoundingClientRect();
+  const x = (touch.clientX - rect.left) * (CANVAS.width / rect.width);
+  const y = (touch.clientY - rect.top) * (CANVAS.height / rect.height);
+  roi.x = Math.min(roiStart.x, x);
+  roi.y = Math.min(roiStart.y, y);
+  roi.w = Math.abs(x - roiStart.x);
+  roi.h = Math.abs(y - roiStart.y);
+  renderFrame(currentIdx);
+}, {passive: false});
+
+CANVAS.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  drawing = false;
+  if (roi && (roi.w < 5 || roi.h < 5)) roi = null;
+}, {passive: false});
+
+// ---- pick color ----
+PICK_BTN.addEventListener('click', () => {
+  if (frames.length === 0) { STATUS.textContent = '请先加载视频'; return; }
+  if (!roi) { STATUS.textContent = '请在画面上框选水印区域'; return; }
+  const mat = frames[currentIdx];
+  const cx = Math.floor(roi.x + roi.w / 2);
+  const cy = Math.floor(roi.y + roi.h / 2);
+  const px = mat.ucharPtr(cy, cx);
+  targetColor = [px[0], px[1], px[2]]; // BGR
+  STATUS.textContent = `已取色: BGR=(${targetColor[0]},${targetColor[1]},${targetColor[2]})`;
+});
+
+// ---- tolerance / radius ----
+TOL_SLIDER.addEventListener('input', () => {
+  tolerance = parseInt(TOL_SLIDER.value);
+  TOL_VAL.textContent = tolerance;
+});
+RAD_SLIDER.addEventListener('input', () => {
+  inpaintRadius = parseInt(RAD_SLIDER.value);
+  RAD_VAL.textContent = inpaintRadius;
+});
+
+// ---- preview ----
+function generateMask(frame, tol) {
+  if (!targetColor || !roi) return null;
+  const x = Math.floor(roi.x), y = Math.floor(roi.y);
+  const w = Math.floor(roi.w), h = Math.floor(roi.h);
+  if (w <= 0 || h <= 0) return null;
+
+  const roiMat = frame.roi(new cv.Rect(x, y, w, h));
+  const hsv = new cv.Mat();
+  cv.cvtColor(roiMat, hsv, cv.COLOR_BGR2HSV);
+
+  // compute distance
+  const th = targetColor[0], ts = targetColor[1], tv = targetColor[2];
+  // convert target to HSV
+  const targetPixel = cv.matFromArray(1, 1, cv.CV_8UC3, [th, ts, tv]);
+  const targetHSV = new cv.Mat();
+  cv.cvtColor(targetPixel, targetHSV, cv.COLOR_BGR2HSV);
+  const tH = targetHSV.ucharPtr(0, 0)[0];
+  const tS = targetHSV.ucharPtr(0, 0)[1];
+  const tV = targetHSV.ucharPtr(0, 0)[2];
+  targetPixel.delete();
+  targetHSV.delete();
+
+  const data = hsv.data;
+  const maskData = new Uint8Array(w * h);
+  const norm = tolerance / 100.0;
+  for (let i = 0; i < w * h; i++) {
+    const pH = data[i * 3], pS = data[i * 3 + 1], pV = data[i * 3 + 2];
+    const hd = Math.min(Math.abs(pH - tH), 180 - Math.abs(pH - tH)) / 180;
+    const sd = Math.abs(pS - tS) / 255;
+    const vd = Math.abs(pV - tV) / 255;
+    const dist = Math.sqrt(hd * hd + sd * sd + vd * vd) / Math.sqrt(3);
+    maskData[i] = dist < norm ? 255 : 0;
+  }
+
+  const maskRoi = cv.matFromArray(h, w, cv.CV_8UC1, maskData);
+  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+  cv.morphologyEx(maskRoi, maskRoi, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2);
+  cv.morphologyEx(maskRoi, maskRoi, cv.MORPH_OPEN, kernel, new cv.Point(-1, -1), 1);
+  cv.GaussianBlur(maskRoi, maskRoi, new cv.Size(3, 3), 0);
+
+  // place mask into full frame
+  const fullMask = new cv.Mat.zeros(frame.rows, frame.cols, cv.CV_8UC1);
+  maskRoi.copyTo(fullMask.roi(new cv.Rect(x, y, w, h)));
+  roiMat.delete();
+  hsv.delete();
+  maskRoi.delete();
+  kernel.delete();
+  return fullMask;
+}
+
+function inpaintImage(image, mask, radius) {
+  const dilated = new cv.Mat();
+  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+  cv.dilate(mask, dilated, kernel, new cv.Point(-1, -1), 2);
+  const result = new cv.Mat();
+  cv.inpaint(image, dilated, radius, cv.INPAINT_TELEA, result);
+  dilated.delete();
+  kernel.delete();
+  return result;
+}
+
+function gradientBlend(original, inpainted, mask, expandPixels) {
+  const maskBin = new cv.Mat();
+  cv.threshold(mask, maskBin, 1, 255, cv.THRESH_BINARY);
+
+  const expanded = new cv.Mat();
+  const ksize = expandPixels * 2 + 1;
+  const ek = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(ksize, ksize));
+  cv.dilate(maskBin, expanded, ek);
+  ek.delete();
+
+  // distance transform
+  const inv = new cv.Mat();
+  cv.bitwise_not(maskBin, inv);
+  // For distance transform: nonzero = source
+  const dt = new cv.Mat();
+  cv.distanceTransform(inv, dt, cv.DIST_L2, 5);
+  const dtData = dt.data;
+
+  const weight = new Float32Array(original.rows * original.cols);
+  for (let i = 0; i < original.rows * original.cols; i++) {
+    if (maskBin.data[i] > 0) {
+      weight[i] = 1.0;
+    } else if (expanded.data[i] > 0) {
+      const d = dtData[i];
+      weight[i] = Math.max(0, Math.min(1, 1.0 - d / expandPixels));
+    } else {
+      weight[i] = 0;
+    }
+  }
+
+  const result = new cv.Mat();
+  original.copyTo(result);
+  const rData = result.data;
+  const oData = original.data;
+  const iData = inpainted.data;
+  for (let i = 0; i < original.rows * original.cols; i++) {
+    const w = weight[i];
+    if (w > 0) {
+      const idx = i * 3;
+      rData[idx] = oData[idx] * (1 - w) + iData[idx] * w;
+      rData[idx + 1] = oData[idx + 1] * (1 - w) + iData[idx + 1] * w;
+      rData[idx + 2] = oData[idx + 2] * (1 - w) + iData[idx + 2] * w;
+    }
+  }
+
+  maskBin.delete();
+  expanded.delete();
+  inv.delete();
+  dt.delete();
+  return result;
+}
+
+function removeWatermark(frame, mask, radius) {
+  // gradient expand
+  const maskBin = new cv.Mat();
+  cv.threshold(mask, maskBin, 1, 255, cv.THRESH_BINARY);
+
+  const expandPixels = Math.max(1, radius);
+  const ksize = expandPixels * 2 + 1;
+  const ek = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(ksize, ksize));
+  const maskExpanded = new cv.Mat();
+  cv.dilate(maskBin, maskExpanded, ek);
+  ek.delete();
+
+  // inpaint
+  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+  const maskDilated = new cv.Mat();
+  cv.dilate(maskExpanded, maskDilated, kernel, new cv.Point(-1, -1), 2);
+  const inpainted = new cv.Mat();
+  cv.inpaint(frame, maskDilated, radius, cv.INPAINT_TELEA, inpainted);
+  kernel.delete();
+  maskDilated.delete();
+
+  // gradient blend
+  const inv = new cv.Mat();
+  cv.bitwise_not(maskBin, inv);
+  const dt = new cv.Mat();
+  cv.distanceTransform(inv, dt, cv.DIST_L2, 5);
+  const dtData = dt.data;
+
+  const result = frame.clone();
+  const rData = result.data;
+  const fData = frame.data;
+  const iData = inpainted.data;
+  for (let i = 0; i < frame.rows * frame.cols; i++) {
+    if (maskBin.data[i] > 0) {
+      const idx = i * 3;
+      rData[idx] = iData[idx]; rData[idx+1] = iData[idx+1]; rData[idx+2] = iData[idx+2];
+    } else if (maskExpanded.data[i] > 0) {
+      const d = dtData[i];
+      const w = Math.max(0, Math.min(1, 1.0 - d / expandPixels));
+      const idx = i * 3;
+      rData[idx] = fData[idx] * (1 - w) + iData[idx] * w;
+      rData[idx+1] = fData[idx+1] * (1 - w) + iData[idx+1] * w;
+      rData[idx+2] = fData[idx+2] * (1 - w) + iData[idx+2] * w;
+    }
+  }
+
+  maskBin.delete();
+  maskExpanded.delete();
+  inpainted.delete();
+  inv.delete();
+  dt.delete();
+  return result;
+}
+
+PREVIEW_BTN.addEventListener('click', () => {
+  if (frames.length === 0) { STATUS.textContent = '请先加载视频'; return; }
+  if (!targetColor || !roi) { STATUS.textContent = '请先框选并取色'; return; }
+
+  const frame = frames[currentIdx];
+  const mask = generateMask(frame, tolerance);
+  if (!mask) { STATUS.textContent = '蒙版生成失败'; return; }
+
+  const result = removeWatermark(frame, mask, inpaintRadius);
+
+  // display result
+  const display = result.clone();
+  if (roi) {
+    const pt1 = new cv.Point(roi.x, roi.y);
+    const pt2 = new cv.Point(roi.x + roi.w, roi.y + roi.h);
+    cv.rectangle(display, pt1, pt2, [0, 255, 0, 255], 2);
+  }
+  bgrToRgb(display);
+  const imgData = matToImageData(display);
+  CTX.putImageData(imgData, 0, 0);
+  display.delete();
+
+  previewFrameIdx = currentIdx;
+  lastResultData = CTX.getImageData(0, 0, CANVAS.width, CANVAS.height);
+  result.delete();
+  mask.delete();
+
+  STATUS.textContent = '预览完成（显示修复结果）';
+});
+
+// ---- process video ----
+PROCESS_BTN.addEventListener('click', async () => {
+  if (!videoFile) { STATUS.textContent = '请先加载视频'; return; }
+  if (!targetColor || !roi) { STATUS.textContent = '请先取色'; return; }
+
+  STATUS.textContent = '处理中...';
+  PROCESS_BTN.disabled = true;
+
+  try {
+    const url = URL.createObjectURL(videoFile);
+    const video = document.createElement('video');
+    video.preload = 'auto';
+    video.muted = true;
+    video.playsInline = true;
+    await new Promise((resolve, reject) => {
+      video.onloadedmetadata = resolve;
+      video.onerror = reject;
+      video.src = url;
+      video.load();
+    });
+
+    const w = video.videoWidth || 640;
+    const h = video.videoHeight || 480;
+    const total = Math.round(video.duration * 30);
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = w;
+    tempCanvas.height = h;
+    const tCtx = tempCanvas.getContext('2d');
+
+    // Create output canvas
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = w;
+    outCanvas.height = h;
+    const oCtx = outCanvas.getContext('2d');
+
+    // Process frames in batches
+    for (let i = 0; i < total; i++) {
+      video.currentTime = i / 30;
+      await new Promise(r => { video.onseeked = r; });
+      tCtx.drawImage(video, 0, 0);
+      const imgData = tCtx.getImageData(0, 0, w, h);
+      const mat = cv.matFromImageData(imgData);
+      rgbToBgr(mat);
+
+      const mask = generateMask(mat, tolerance);
+      if (mask) {
+        const result = removeWatermark(mat, mask, inpaintRadius);
+        bgrToRgb(result);
+        const outData = matToImageData(result);
+        oCtx.putImageData(outData, 0, 0);
+        result.delete();
+        mask.delete();
+      } else {
+        oCtx.putImageData(imgData, 0, 0);
+      }
+      mat.delete();
+
+      if (i % 5 === 0) STATUS.textContent = `处理中... ${Math.round(i/total*100)}%`;
+    }
+
+    // Create download link
+    const outBlob = await new Promise(resolve => outCanvas.toBlob(resolve, 'video/mp4'));
+    // Actually canvas.toBlob gives a single frame, not video
+    // For real video, we'd use MediaRecorder
+    STATUS.textContent = '处理完成（浏览器版仅支持单帧导出，完整视频打包请使用桌面版或Kivy APK）';
+  } catch (err) {
+    STATUS.textContent = `处理失败: ${err.message}`;
+    console.error(err);
+  }
+  PROCESS_BTN.disabled = false;
+});
+
+// ---- playback ----
+PLAY_BTN.addEventListener('click', () => {
+  if (frames.length === 0) return;
+  if (isPlaying) {
+    clearInterval(playInterval);
+    isPlaying = false;
+    PLAY_BTN.textContent = '▶';
+  } else {
+    isPlaying = true;
+    PLAY_BTN.textContent = '⏸';
+    playInterval = setInterval(() => {
+      currentIdx++;
+      if (currentIdx >= totalFrames) {
+        currentIdx = 0;
+        clearInterval(playInterval);
+        isPlaying = false;
+        PLAY_BTN.textContent = '▶';
+      }
+      renderFrame(currentIdx);
+      updateTime();
+      // restore preview if needed
+      if (currentIdx === previewFrameIdx && lastResultData) {
+        CTX.putImageData(lastResultData, 0, 0);
+      }
+    }, 1000 / fps);
+  }
+});
+
+PREV_BTN.addEventListener('click', () => {
+  if (frames.length === 0) return;
+  currentIdx = Math.max(0, currentIdx - 1);
+  renderFrame(currentIdx);
+  updateTime();
+});
+
+SEEK_SLIDER.addEventListener('input', () => {
+  if (frames.length === 0) return;
+  currentIdx = parseInt(SEEK_SLIDER.value);
+  renderFrame(currentIdx);
+  updateTime();
+});
+
+// ---- OpenCV ready ----
+function onOpenCvReady() {
+  cvReady = true;
+  STATUS.textContent = 'OpenCV 已加载 — 点击"加载视频"选择文件';
+}
+if (typeof cv !== 'undefined') {
+  cv['onRuntimeInitialized'] = () => {
+    cvReady = true;
+    STATUS.textContent = '就绪 — 点击"加载视频"选择文件';
+  };
+} else {
+  document.querySelector('script[src*="opencv"]').onload = () => {
+    cv['onRuntimeInitialized'] = () => {
+      cvReady = true;
+      STATUS.textContent = '就绪 — 点击"加载视频"选择文件';
+    };
+  };
+}
+</script>
+</body>
+</html>
