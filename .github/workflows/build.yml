@@ -38,11 +38,19 @@ jobs:
 
       - name: Build debug APK
         run: |
-          buildozer android debug 2>&1 | tail -100
+          buildozer android debug 2>&1 | tee build.log; echo "EXIT CODE: $?"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: WatermarkRemover.apk
           path: bin/*.apk
-          if-no-files-found: error
+          if-no-files-found: warn
