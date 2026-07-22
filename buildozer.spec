@@ -21,7 +21,6 @@ android.private_storage = True
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,READ_MEDIA_VIDEO
 android.wakelock = True
 android.enable_p4a = True
-android.gradle_dependencies = 'androidx.core:core:1.12.0'
 
 # iOS (skip)
 ios.codesign.allowed = false
