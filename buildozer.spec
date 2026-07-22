@@ -5,7 +5,7 @@ package.domain = com.xly
 source.dir = .
 source.include_exts = py,png,jpg,jpeg,gif,ttf,mp4
 version = 1.0.0
-requirements = python3==3.11.9,kivy==2.3.0,pillow,numpy,pyjnius,certifi
+requirements = python3,kivy==2.3.0,pillow,numpy,pyjnius,certifi
 orientation = landscape
 osx.python_version = 3
 osx.kivy_version = 2.2.1
