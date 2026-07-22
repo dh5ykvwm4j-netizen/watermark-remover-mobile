@@ -1,9 +1,12 @@
 import os
 import sys
-import cv2
-import numpy as np
+import math
+import time
 from collections import deque
 from threading import Thread, Event
+
+from PIL import Image, ImageDraw, ImageFilter, ImageChops
+import colorsys
 
 from kivy.app import App
 from kivy.clock import Clock
@@ -12,193 +15,215 @@ from kivy.graphics import Color, Rectangle, Line
 from kivy.graphics.texture import Texture
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.relativelayout import RelativeLayout
-from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
 from kivy.uix.button import Button
 from kivy.uix.slider import Slider
-from kivy.uix.textinput import TextInput
 from kivy.uix.togglebutton import ToggleButton
-from kivy.uix.checkbox import CheckBox
 from kivy.uix.popup import Popup
 from kivy.uix.filechooser import FileChooserListView
-from kivy.uix.scrollview import ScrollView
 from kivy.utils import platform
 
-# ==================== 去水印算法 (原样复用) ====================
-class StructureGuidedInpainter:
-    def __init__(self, angle_threshold=50, edge_extend_steps=100):
-        self.angle_threshold = angle_threshold
-        self.edge_extend_steps = edge_extend_steps
+ANDROID = (platform == "android")
 
-    def inpaint(self, image, mask, radius=None):
-        if mask is None or not np.any(mask):
-            return image
-        mask_binary = (mask > 0).astype(np.uint8)
-        result = image.copy()
-        h, w = image.shape[:2]
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        edges_full = cv2.Canny(gray, 50, 150)
-        kernel = np.ones((5, 5), np.uint8)
-        dilated_mask = cv2.dilate(mask_binary, kernel, iterations=2)
-        outer_ring = (dilated_mask - mask_binary) > 0
-        reliable_edges = edges_full & outer_ring.astype(np.uint8)
-        boundary = cv2.Canny(mask_binary * 255, 100, 200)
-        intersection = reliable_edges & boundary
-        if np.count_nonzero(intersection) == 0:
-            r = max(3, min(int(np.sqrt(np.count_nonzero(mask_binary) / np.pi)), 20))
-            inpainted = cv2.inpaint(result, mask_binary, r, cv2.INPAINT_TELEA)
-            mf = mask_binary.astype(np.float32)
-            m3 = np.stack([mf] * 3, axis=-1)
-            result = (result * (1 - m3) + inpainted * m3).astype(np.uint8)
-            return cv2.bilateralFilter(result, 5, 50, 50)
-        pts = np.column_stack(np.where(intersection > 0))
-        extended_lines_mask = np.zeros((h, w), dtype=np.uint8)
-        for (y0, x0) in pts:
-            if y0 < 1 or y0 >= h - 1 or x0 < 1 or x0 >= w - 1:
-                continue
-            gx = float(gray[y0, x0 + 1]) - float(gray[y0, x0 - 1])
-            gy = float(gray[y0 + 1, x0]) - float(gray[y0 - 1, x0])
-            dx, dy = -gy, gx
-            length = np.sqrt(dx * dx + dy * dy)
-            if length == 0:
-                continue
-            dx /= length
-            dy /= length
-            for sign in (1, -1):
-                cur_dx = dx * sign
-                cur_dy = dy * sign
-                dir_history = deque(maxlen=5)
-                line_pts = [(x0, y0)]
-                cur_x, cur_y = float(x0), float(y0)
-                for step in range(1, self.edge_extend_steps):
-                    cur_x += cur_dx
-                    cur_y += cur_dy
-                    ix, iy = int(round(cur_x)), int(round(cur_y))
-                    if ix < 0 or ix >= w or iy < 0 or iy >= h:
-                        break
-                    if mask_binary[iy, ix] == 0:
-                        if boundary[iy, ix]:
-                            line_pts.append((ix, iy))
-                        break
-                    line_pts.append((ix, iy))
-                    if len(line_pts) >= 3:
-                        p1 = np.array(line_pts[-3])
-                        p2 = np.array(line_pts[-2])
-                        p3 = np.array(line_pts[-1])
-                        v1 = p2 - p1
-                        v2 = p3 - p2
-                        n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-                        if n1 > 0 and n2 > 0:
-                            cos_a = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-                            if np.degrees(np.arccos(cos_a)) > self.angle_threshold:
-                                line_pts.pop()
-                                break
-                    dir_history.append((cur_dx, cur_dy))
-                    if len(dir_history) > 1:
-                        avg_dx = np.mean([d[0] for d in dir_history])
-                        avg_dy = np.mean([d[1] for d in dir_history])
-                        cur_dx = cur_dx * 0.3 + avg_dx * 0.7
-                        norm = np.sqrt(cur_dx ** 2 + cur_dy ** 2)
-                        if norm > 0:
-                            cur_dx /= norm
-                            cur_dy /= norm
-                if len(line_pts) >= 2:
-                    pts_arr = np.array(line_pts, dtype=np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(extended_lines_mask, [pts_arr], False, 255, thickness=1, lineType=cv2.LINE_AA)
-        if np.any(extended_lines_mask):
-            outer_ring_dilated = cv2.dilate(mask_binary, np.ones((3, 3), np.uint8), iterations=3)
-            outer_ring_only = (outer_ring_dilated - mask_binary) > 0
-            ring_coords = np.column_stack(np.where(outer_ring_only))
-            if len(ring_coords) > 0:
-                ring_colors = image[ring_coords[:, 0], ring_coords[:, 1]]
-                lines_ys, lines_xs = np.where(extended_lines_mask > 0)
-                for ly, lx in zip(lines_ys, lines_xs):
-                    diffs = ring_coords - np.array([ly, lx])
-                    dists = np.sum(diffs ** 2, axis=1)
-                    result[ly, lx] = ring_colors[np.argmin(dists)]
-        if np.any(mask_binary):
-            r = max(3, min(int(np.sqrt(np.count_nonzero(mask_binary) / np.pi)), 20))
-            inpainted = cv2.inpaint(result, mask_binary, r, cv2.INPAINT_TELEA)
-            mf = mask_binary.astype(np.float32)
-            m3 = np.stack([mf] * 3, axis=-1)
-            result = (result * (1 - m3) + inpainted * m3).astype(np.uint8)
-        return cv2.bilateralFilter(result, 5, 50, 50)
+if ANDROID:
+    from jnius import autoclass
+    from android import activity as android_activity
+    mActivity = autoclass("org.kivy.android.PythonActivity").mActivity
+    Context = autoclass("android.content.Context")
+    ContentResolver = autoclass("android.content.ContentResolver")
+    Uri = autoclass("android.net.Uri")
+    Intent = autoclass("android.content.Intent")
+    MediaMetadataRetriever = autoclass("android.media.MediaMetadataRetriever")
+    MediaCodec = autoclass("android.media.MediaCodec")
+    MediaFormat = autoclass("android.media.MediaFormat")
+    MediaMuxer = autoclass("android.media.MediaMuxer")
+    Bitmap = autoclass("android.graphics.Bitmap")
+    BitmapFactory = autoclass("android.graphics.BitmapFactory")
+    ColorJava = autoclass("android.graphics.Color")
+    Canvas = autoclass("android.graphics.Canvas")
+    ByteArrayOutputStream = autoclass("java.io.ByteArrayOutputStream")
+    BitmapFactory_Options = autoclass("android.graphics.BitmapFactory$Options")
 
-class EnhancedInpainter:
-    def inpaint(self, image, mask, radius):
-        kernel = np.ones((5, 5), np.uint8)
-        mask_dilated = cv2.dilate(mask, kernel, iterations=2)
-        inp = cv2.inpaint(image, mask_dilated, radius, cv2.INPAINT_TELEA)
-        try:
-            smoothed = cv2.ximgproc.guidedFilter(guide=inp, src=inp, radius=radius * 2, eps=1e-4)
-        except Exception:
-            smoothed = cv2.bilateralFilter(inp, 9, 50, 50)
-        mf = mask_dilated.astype(np.float32) / 255.0
-        m3 = np.stack([mf] * 3, axis=-1)
-        return (inp * (1 - m3) + smoothed * m3).astype(np.uint8)
+
+def pil_to_texture(pil_img):
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    w, h = pil_img.size
+    tex = Texture.create(size=(w, h), colorfmt="rgb")
+    tex.flip_vertical()
+    data = pil_img.tobytes()
+    tex.blit_buffer(data, size=(w, h), colorfmt="rgb")
+    return tex
+
+
+def android_bitmap_to_pil(bitmap):
+    w = bitmap.getWidth()
+    h = bitmap.getHeight()
+    pixels = [0] * (w * h)
+    bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+    img = Image.new("RGB", (w, h))
+    px = img.load()
+    for y in range(h):
+        for x in range(w):
+            c = pixels[y * w + x]
+            r = (c >> 16) & 0xFF
+            g = (c >> 8) & 0xFF
+            b = c & 0xFF
+            px[x, y] = (r, g, b)
+    return img
+
+
+def extract_frame_android(video_path, time_us):
+    mmr = MediaMetadataRetriever()
+    mmr.setDataSource(video_path)
+    bitmap = mmr.getFrameAtTime(time_us, 0)
+    mmr.release()
+    if bitmap is None:
+        return None
+    return android_bitmap_to_pil(bitmap)
+
 
 class WatermarkRemover:
     def __init__(self):
-        self.target_hsv = None
+        self.target_rgb = None
         self.roi = None
         self.tolerance = 30
         self.inpaint_radius = 5
         self.method = "enhanced"
-        self._structure = StructureGuidedInpainter()
-        self._enhanced = EnhancedInpainter()
 
-    def set_target(self, bgr):
-        arr = np.uint8([[list(bgr)]])
-        self.target_hsv = cv2.cvtColor(arr, cv2.COLOR_BGR2HSV)[0][0].astype(float)
+    def set_target(self, rgb):
+        self.target_rgb = rgb
 
     def set_roi(self, x, y, w, h):
         self.roi = (int(x), int(y), int(w), int(h))
 
-    def generate_mask(self, frame):
-        if self.target_hsv is None or self.roi is None:
+    def _color_distance(self, c1, c2):
+        r1, g1, b1 = c1
+        r2, g2, b2 = c2
+        return math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2) / 441.67
+
+    def generate_mask(self, frame_pil):
+        if self.target_rgb is None or self.roi is None:
             return None
         x, y, w, h = self.roi
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(float)
-        roi_hsv = hsv[y:y + h, x:x + w].reshape(-1, 3)
-        h_diff = np.abs(roi_hsv[:, 0] - self.target_hsv[0])
-        h_diff = np.minimum(h_diff, 180 - h_diff)
-        s_diff = np.abs(roi_hsv[:, 1] - self.target_hsv[1])
-        v_diff = np.abs(roi_hsv[:, 2] - self.target_hsv[2])
-        dist = np.sqrt((h_diff / 180) ** 2 + (s_diff / 255) ** 2 + (v_diff / 255) ** 2) / np.sqrt(3)
-        mask_roi = (dist < self.tolerance / 100.0).astype(np.uint8) * 255
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        mask[y:y + h, x:x + w] = mask_roi.reshape(h, w)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        return cv2.GaussianBlur(mask, (3, 3), 0)
+        mask = Image.new("L", frame_pil.size, 0)
+        frame_px = frame_pil.load()
+        mask_px = mask.load()
+        tr, tg, tb = self.target_rgb
+        tol = self.tolerance / 100.0
+        for py in range(max(0, y), min(frame_pil.height, y + h)):
+            for px in range(max(0, x), min(frame_pil.width, x + w)):
+                r, g, b = frame_px[px, py]
+                dist = math.sqrt(((r - tr) / 255.0) ** 2 + ((g - tg) / 255.0) ** 2 + ((b - tb) / 255.0) ** 2) / math.sqrt(3)
+                if dist < tol:
+                    mask_px[px, py] = 255
+        mask = mask.filter(ImageFilter.MinFilter(3))
+        mask = mask.filter(ImageFilter.MaxFilter(5))
+        mask = mask.filter(ImageFilter.GaussianBlur(1))
+        return mask
 
-    def remove(self, frame):
+    def _simple_inpaint(self, frame_pil, mask_pil, radius):
+        result = frame_pil.copy()
+        result_px = result.load()
+        mask_px = mask_pil.load()
+        w, h = frame_pil.size
+        for y in range(h):
+            for x in range(w):
+                if mask_px[x, y] > 0:
+                    neighbors = []
+                    for dy in range(-radius, radius + 1):
+                        for dx in range(-radius, radius + 1):
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < w and 0 <= ny < h and mask_px[nx, ny] == 0:
+                                neighbors.append(result_px[nx, ny])
+                    if neighbors:
+                        r = sum(c[0] for c in neighbors) // len(neighbors)
+                        g = sum(c[1] for c in neighbors) // len(neighbors)
+                        b = sum(c[2] for c in neighbors) // len(neighbors)
+                        result_px[x, y] = (r, g, b)
+        return result
+
+    def _structure_inpaint(self, frame_pil, mask_pil):
+        w, h = frame_pil.size
+        mask_px = mask_pil.load()
+        frame_px = frame_pil.load()
+        result = frame_pil.copy()
+        result_px = result.load()
+        outer = mask_pil.filter(ImageFilter.MaxFilter(7))
+        outer_px = outer.load()
+        ring_pixels = []
+        for y in range(h):
+            for x in range(w):
+                if outer_px[x, y] > 0 and mask_px[x, y] == 0:
+                    ring_pixels.append((x, y, frame_px[x, y]))
+        for y in range(h):
+            for x in range(w):
+                if mask_px[x, y] > 0 and ring_pixels:
+                    min_dist = float("inf")
+                    best_color = (128, 128, 128)
+                    src_r, src_g, src_b = frame_px[x, y]
+                    for rx, ry, (rr, rg, rb) in ring_pixels:
+                        d = (rx - x) ** 2 + (ry - y) ** 2 + ((rr - src_r) ** 2 + (rg - src_g) ** 2 + (rb - src_b) ** 2) * 0.01
+                        if d < min_dist:
+                            min_dist = d
+                            best_color = (rr, rg, rb)
+                    result_px[x, y] = best_color
+        return result
+
+    def _enhanced_inpaint(self, frame_pil, mask_pil, radius):
+        blurred = frame_pil.filter(ImageFilter.GaussianBlur(radius * 2))
+        result = frame_pil.copy()
+        result_px = result.load()
+        blurred_px = blurred.load()
+        mask_px = mask_pil.load()
+        w, h = frame_pil.size
+        expanded = mask_pil.filter(ImageFilter.MaxFilter(max(3, radius * 2 + 1)))
+        expanded_px = expanded.load()
+        for y in range(h):
+            for x in range(w):
+                if expanded_px[x, y] > 0:
+                    m_val = mask_px[x, y]
+                    if m_val > 0:
+                        alpha = 1.0
+                    else:
+                        edge_dist = 0
+                        for d in range(1, radius + 1):
+                            found = False
+                            for dx in range(-d, d + 1):
+                                for dy in range(-d, d + 1):
+                                    if abs(dx) == d or abs(dy) == d:
+                                        nx, ny = x + dx, y + dy
+                                        if 0 <= nx < w and 0 <= ny < h and mask_px[nx, ny] > 0:
+                                            found = True
+                                            break
+                                if found:
+                                    break
+                            if found:
+                                edge_dist = d
+                                break
+                        alpha = max(0, 1.0 - edge_dist / max(1, radius))
+                    orig = result_px[x, y]
+                    blur = blurred_px[x, y]
+                    r = int(orig[0] * (1 - alpha) + blur[0] * alpha)
+                    g = int(orig[1] * (1 - alpha) + blur[1] * alpha)
+                    b = int(orig[2] * (1 - alpha) + blur[2] * alpha)
+                    result_px[x, y] = (min(255, r), min(255, g), min(255, b))
+        return result
+
+    def remove(self, frame_pil):
         try:
-            mask = self.generate_mask(frame)
-            if mask is None or not np.any(mask):
-                return frame
-            mask_bin = (mask > 0).astype(np.uint8)
-            expand_pixels = max(1, self.inpaint_radius)
-            ksize = expand_pixels * 2 + 1
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-            mask_expanded = cv2.dilate(mask_bin, k, iterations=1)
-            inv = (1 - mask_bin) * 255
-            dist = cv2.distanceTransform(inv.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
-            weight = np.zeros_like(dist)
-            weight[mask_bin > 0] = 1.0
-            ring = (mask_expanded > 0) & (mask_bin == 0)
-            if np.any(ring):
-                weight[ring] = np.clip(1.0 - dist[ring] / float(expand_pixels), 0, 1)
+            mask = self.generate_mask(frame_pil)
+            if mask is None:
+                return frame_pil
+            if not any(mask.load()[x, y] > 0 for y in range(mask.height) for x in range(mask.width)):
+                return frame_pil
+            expanded = mask.filter(ImageFilter.MaxFilter(max(3, self.inpaint_radius * 2 + 1)))
             if self.method == "structure":
-                inpainted = self._structure.inpaint(frame, mask_expanded * 255)
+                return self._structure_inpaint(frame_pil, expanded)
             elif self.method == "enhanced":
-                inpainted = self._enhanced.inpaint(frame, mask_expanded * 255, self.inpaint_radius)
+                return self._enhanced_inpaint(frame_pil, expanded, self.inpaint_radius)
             else:
-                inpainted = self._inpaint_classic(mask_expanded * 255, frame)
-            w3 = np.stack([weight] * 3, axis=-1)
-            return (frame * (1 - w3) + inpainted * w3).astype(np.uint8)
+                return self._simple_inpaint(frame_pil, expanded, self.inpaint_radius)
         except Exception as e:
             import traceback
             try:
@@ -209,45 +234,11 @@ class WatermarkRemover:
                 pass
             raise
 
-    def _inpaint_classic(self, mask, frame):
-        x, y, w, h = self.roi
-        hf, wf = frame.shape[:2]
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        result = frame.copy()
-        for contour in contours:
-            cx, cy, cw, ch = cv2.boundingRect(contour)
-            if cw <= 0 or ch <= 0:
-                continue
-            region = frame[cy:cy + ch, cx:cx + cw]
-            mean_color = region.mean(axis=(0, 1))
-            best_match = None
-            best_dist = float("inf")
-            step = max(cw, ch)
-            for sy in range(0, hf - ch, step):
-                for sx in range(0, wf - cw, step):
-                    if (x <= sx < x + w) and (y <= sy < y + h):
-                        continue
-                    candidate = frame[sy:sy + ch, sx:sx + cw]
-                    cd = np.linalg.norm(candidate.mean(axis=(0, 1)) - mean_color)
-                    if cd < best_dist:
-                        best_dist = cd
-                        best_match = candidate
-            if best_match is None:
-                continue
-            src = cv2.resize(best_match, (cw, ch))
-            cm = np.zeros((hf, wf), dtype=np.uint8)
-            cv2.drawContours(cm, [contour], -1, 255, -1)
-            m3 = (cm[cy:cy + ch, cx:cx + cw] > 0).astype(np.float32)
-            m3 = np.stack([m3] * 3, axis=-1)
-            roi_area = result[cy:cy + ch, cx:cx + cw]
-            result[cy:cy + ch, cx:cx + cw] = (roi_area * (1 - m3) + src * m3).astype(np.uint8)
-        return result
 
-# ==================== Kivy UI ====================
 class VideoWidget(FloatLayout):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.frame_bgr = None
+        self.frame_pil = None
         self.texture = None
         self.roi_start = None
         self.roi_end = None
@@ -255,23 +246,20 @@ class VideoWidget(FloatLayout):
         self.display_scale = 1.0
         self.offset_x = 0
         self.offset_y = 0
-        self._bind_events()
-
-    def _bind_events(self):
         self.bind(size=self._update_display, pos=self._update_display)
 
     def _update_display(self, *args):
-        if self.frame_bgr is not None:
+        if self.frame_pil is not None:
             self._render_frame()
 
-    def set_frame(self, frame_bgr):
-        self.frame_bgr = frame_bgr
+    def set_frame(self, frame_pil):
+        self.frame_pil = frame_pil
         self._render_frame()
 
     def _render_frame(self):
-        if self.frame_bgr is None:
+        if self.frame_pil is None:
             return
-        h, w = self.frame_bgr.shape[:2]
+        w, h = self.frame_pil.size
         vw, vh = self.width, self.height
         if vw <= 0 or vh <= 0:
             return
@@ -280,13 +268,8 @@ class VideoWidget(FloatLayout):
         self.display_scale = scale
         self.offset_x = (vw - nw) / 2
         self.offset_y = (vh - nh) / 2
-        disp = cv2.resize(self.frame_bgr, (nw, nh))
-        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
-        rgb = np.flipud(rgb)
-        if self.texture is None or self.texture.size != (nw, nh):
-            self.texture = Texture.create(size=(nw, nh), colorfmt="rgb")
-            self.texture.flip_vertical()
-        self.texture.blit_buffer(rgb.tobytes(), size=(nw, nh), colorfmt="rgb")
+        disp = self.frame_pil.resize((nw, nh), Image.LANCZOS)
+        self.texture = pil_to_texture(disp)
         self.canvas.clear()
         with self.canvas:
             Color(1, 1, 1, 1)
@@ -304,7 +287,6 @@ class VideoWidget(FloatLayout):
     def _to_frame_coords(self, tx, ty):
         x = (tx - self.offset_x) / self.display_scale
         y = ((self.height - ty) - self.offset_y) / self.display_scale
-        # In Kivy, y increases upward
         return int(x), int(y)
 
     def on_touch_down(self, touch):
@@ -349,10 +331,10 @@ class MainApp(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.remover = WatermarkRemover()
-        self.cap = None
         self.video_path = None
         self.total_frames = 0
-        self.fps = 0
+        self.fps = 30
+        self.current_frame_idx = 0
         self.preview_frame = None
         self.last_result = None
         self.is_playing = False
@@ -360,22 +342,24 @@ class MainApp(App):
         self._play_event = None
         self._process_thread = None
         self._process_cancel = Event()
+        self.video_duration_us = 0
+        self.video_width = 0
+        self.video_height = 0
 
     def build(self):
         Window.size = (900, 600)
         root = BoxLayout(orientation="vertical", spacing=4, padding=4)
 
-        # Top control bar
         controls = BoxLayout(orientation="horizontal", size_hint=(1, None), height=40, spacing=4)
-        self.btn_load = Button(text="加载视频", size_hint=(None, 1), width=80)
+        self.btn_load = Button(text="Load Video", size_hint=(None, 1), width=80)
         self.btn_load.bind(on_press=self._pick_video)
-        self.btn_pick = Button(text="取色", size_hint=(None, 1), width=60)
+        self.btn_pick = Button(text="Pick Color", size_hint=(None, 1), width=80)
         self.btn_pick.bind(on_press=self._pick_color)
-        self.btn_preview = Button(text="预览", size_hint=(None, 1), width=60)
+        self.btn_preview = Button(text="Preview", size_hint=(None, 1), width=70)
         self.btn_preview.bind(on_press=self._preview)
-        self.btn_process = Button(text="处理", size_hint=(None, 1), width=60)
+        self.btn_process = Button(text="Process", size_hint=(None, 1), width=70)
         self.btn_process.bind(on_press=self._start_process)
-        self.btn_method = ToggleButton(text="增强", size_hint=(None, 1), width=60, state="down")
+        self.btn_method = ToggleButton(text="Enhanced", size_hint=(None, 1), width=80, state="down")
         self.btn_method.bind(on_press=self._toggle_method)
         controls.add_widget(self.btn_load)
         controls.add_widget(self.btn_pick)
@@ -383,35 +367,32 @@ class MainApp(App):
         controls.add_widget(self.btn_process)
         controls.add_widget(self.btn_method)
 
-        tol_lbl = Label(text="容差", size_hint=(None, 1), width=30)
+        tol_lbl = Label(text="Tol", size_hint=(None, 1), width=30)
         self.slider_tol = Slider(min=1, max=100, value=self.remover.tolerance, size_hint=(0.15, 1))
         self.slider_tol.bind(value=self._on_tol)
-        self.lbl_tol = Label(text=str(self.remover.tolerance), size_hint=(None, 1), width=25)
+        self.lbl_tol = Label(text=str(self.remover.tolerance), size_hint=(None, 1), width=30)
         controls.add_widget(tol_lbl)
         controls.add_widget(self.slider_tol)
         controls.add_widget(self.lbl_tol)
 
-        rad_lbl = Label(text="半径", size_hint=(None, 1), width=30)
+        rad_lbl = Label(text="Rad", size_hint=(None, 1), width=30)
         self.slider_radius = Slider(min=1, max=30, value=self.remover.inpaint_radius, size_hint=(0.1, 1))
         self.slider_radius.bind(value=self._on_radius)
-        self.lbl_radius = Label(text=str(self.remover.inpaint_radius), size_hint=(None, 1), width=25)
+        self.lbl_radius = Label(text=str(self.remover.inpaint_radius), size_hint=(None, 1), width=30)
         controls.add_widget(rad_lbl)
         controls.add_widget(self.slider_radius)
         controls.add_widget(self.lbl_radius)
 
         root.add_widget(controls)
-
-        # Video display
         self.video = VideoWidget()
         root.add_widget(self.video)
 
-        # Bottom seek bar
         seek = BoxLayout(orientation="horizontal", size_hint=(1, None), height=36, spacing=4)
-        self.btn_play = Button(text="▶", size_hint=(None, 1), width=36)
+        self.btn_play = Button(text="Play", size_hint=(None, 1), width=60)
         self.btn_play.bind(on_press=self._toggle_play)
-        self.btn_prev = Button(text="◀", size_hint=(None, 1), width=36)
+        self.btn_prev = Button(text="Prev", size_hint=(None, 1), width=60)
         self.btn_prev.bind(on_press=self._prev_frame)
-        self.seek_slider = Slider(min=0, max=0, value=0, size_hint=(1, 1))
+        self.seek_slider = Slider(min=0, max=100, value=0, size_hint=(1, 1))
         self.seek_slider.bind(value=self._on_seek_drag)
         self.lbl_time = Label(text="00:00 / 00:00", size_hint=(None, 1), width=120)
         seek.add_widget(self.btn_play)
@@ -420,14 +401,12 @@ class MainApp(App):
         seek.add_widget(self.lbl_time)
         root.add_widget(seek)
 
-        # Status label
-        self.lbl_status = Label(text="就绪", size_hint=(1, None), height=20, halign="left", valign="middle")
+        self.lbl_status = Label(text="Ready", size_hint=(1, None), height=20, halign="left", valign="middle")
         self.lbl_status.bind(size=self.lbl_status.setter("text_size"))
         root.add_widget(self.lbl_status)
 
         return root
 
-    # --- callbacks ---
     def _on_tol(self, inst, val):
         v = int(val)
         self.remover.tolerance = v
@@ -441,14 +420,13 @@ class MainApp(App):
     def _toggle_method(self, btn):
         if btn.state == "down":
             self.remover.method = "enhanced"
-            btn.text = "增强"
+            btn.text = "Enhanced"
         else:
             self.remover.method = "structure"
-            btn.text = "结构"
+            btn.text = "Structure"
 
     def _pick_video(self, btn):
-        if platform == "android":
-            from androidstorage import AndroidStorage
+        if ANDROID:
             self._android_pick_video()
         else:
             self._show_file_chooser()
@@ -456,173 +434,300 @@ class MainApp(App):
     def _show_file_chooser(self):
         content = BoxLayout(orientation="vertical")
         fc = FileChooserListView(path=os.path.expanduser("~"))
-        btn_ok = Button(text="选择", size_hint=(1, None), height=40)
-        popup = Popup(title="选择视频文件", content=content, size_hint=(0.9, 0.9))
+        btn_ok = Button(text="Select", size_hint=(1, None), height=40)
+        popup = Popup(title="Select video file", content=content, size_hint=(0.9, 0.9))
         content.add_widget(fc)
         content.add_widget(btn_ok)
+
         def on_select(inst):
             if fc.selection:
                 self._open_video(fc.selection[0])
             popup.dismiss()
+
         btn_ok.bind(on_press=on_select)
         popup.open()
 
     def _android_pick_video(self):
         try:
-            from android import activity, mActivity
-            from jnius import autoclass
-            Intent = autoclass("android.content.Intent")
-            Uri = autoclass("android.net.Uri")
             intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
             intent.setType("video/*")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
             mActivity.startActivityForResult(intent, 1001)
-            activity.bind(on_activity_result=self._on_android_result)
+            android_activity.bind(on_activity_result=self._on_android_result)
         except Exception as e:
-            self.lbl_status.text = f"无法打开文件选择器: {e}"
+            self.lbl_status.text = f"Error: {e}"
 
     def _on_android_result(self, requestCode, resultCode, intent):
         if requestCode == 1001 and resultCode == -1:
-            from jnius import autoclass
-            Uri = autoclass("android.net.Uri")
             uri = intent.getData()
-            ContentResolver = autoclass("android.content.ContentResolver")
-            cr = App.get_running_app().mActivity.getContentResolver()
-            input = cr.openInputStream(uri)
-            from androidstorage import AndroidStorage
-            dst = os.path.join(os.environ.get("EXTERNAL_STORAGE", "/sdcard"), "temp_input_video.mp4")
+            cr = mActivity.getContentResolver()
+            inp = cr.openInputStream(uri)
+            dst = os.path.join(os.environ.get("EXTERNAL_STORAGE", "/sdcard"), "temp_input.mp4")
             with open(dst, "wb") as f:
-                f.write(input.read())
-            input.close()
+                while True:
+                    data = inp.read(65536)
+                    if not data:
+                        break
+                    f.write(data)
+            inp.close()
             self._open_video(dst)
 
     def _open_video(self, path):
-        self.cap = cv2.VideoCapture(path)
-        if not self.cap.isOpened():
-            self.lbl_status.text = "无法打开视频文件"
-            return
         self.video_path = path
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-        ret, frame = self.cap.read()
-        if ret:
-            self.preview_frame = frame
+        if ANDROID:
+            self._open_video_android(path)
+        else:
+            self._open_video_pil(path)
+
+    def _open_video_android(self, path):
+        try:
+            mmr = MediaMetadataRetriever()
+            mmr.setDataSource(path)
+            dur_str = mmr.extractMetadata(9)
+            self.video_duration_us = int(dur_str) if dur_str else 0
+            w_str = mmr.extractMetadata(18)
+            h_str = mmr.extractMetadata(19)
+            self.video_width = int(w_str) if w_str else 640
+            self.video_height = int(h_str) if h_str else 480
+            self.fps = 30
+            if self.video_duration_us > 0:
+                self.total_frames = max(1, int(self.video_duration_us * self.fps / 1000000))
+            else:
+                self.total_frames = 1
+            self.current_frame_idx = 0
+            frame = self._get_frame_android(0)
+            mmr.release()
+            if frame:
+                self.preview_frame = frame
+                self.last_result = None
+                self.video.set_frame(frame)
+            self.seek_slider.max = max(0, self.total_frames - 1)
+            self.seek_slider.value = 0
+            self._update_time()
+            self.lbl_status.text = f"Loaded: {os.path.basename(path)} ({self.total_frames} frames)"
+        except Exception as e:
+            self.lbl_status.text = f"Error loading: {e}"
+
+    def _open_video_pil(self, path):
+        try:
+            from PIL import ImageSequence
+            img = Image.open(path)
+            self.total_frames = getattr(img, "n_frames", 1)
+            self.fps = getattr(img, "info", {}).get("fps", 10)
+            self.current_frame_idx = 0
+            self.video_width, self.video_height = img.size
+            self.preview_frame = img.copy().convert("RGB")
             self.last_result = None
-            self.video.set_frame(frame)
-        self.seek_slider.max = max(0, self.total_frames - 1)
-        self.seek_slider.value = 0
-        self._update_time()
-        self.lbl_status.text = f"已加载: {os.path.basename(path)}  ({self.total_frames}帧)"
+            self.video.set_frame(self.preview_frame)
+            self.seek_slider.max = max(0, self.total_frames - 1)
+            self.seek_slider.value = 0
+            self._update_time()
+            self.lbl_status.text = f"Loaded: {os.path.basename(path)} ({self.total_frames} frames)"
+        except Exception as e:
+            self.lbl_status.text = f"Error: {e}"
+
+    def _get_frame_android(self, frame_idx):
+        if not self.video_path:
+            return None
+        time_us = int(frame_idx * 1000000 / self.fps)
+        return extract_frame_android(self.video_path, time_us)
+
+    def _get_frame_pil(self, frame_idx):
+        try:
+            from PIL import ImageSequence
+            img = Image.open(self.video_path)
+            img.seek(min(frame_idx, self.total_frames - 1))
+            return img.copy().convert("RGB")
+        except Exception:
+            return None
+
+    def _get_frame(self, frame_idx):
+        if ANDROID:
+            return self._get_frame_android(frame_idx)
+        else:
+            return self._get_frame_pil(frame_idx)
 
     def _pick_color(self, btn):
         if self.preview_frame is None:
-            self.lbl_status.text = "请先加载视频帧"
+            self.lbl_status.text = "Load a video first"
             return
         roi = self.video.get_roi()
         if roi is None:
-            self.lbl_status.text = "请在画面上框选水印区域"
+            self.lbl_status.text = "Draw a ROI on the video first"
             return
         x, y, w, h = roi
         self.remover.set_roi(x, y, w, h)
-        center = self.preview_frame[y + h//2, x + w//2]
-        self.remover.set_target(tuple(center))
-        self.lbl_status.text = f"已取色: HSV={self.remover.target_hsv}"
+        cx, cy = x + w // 2, y + h // 2
+        px = self.preview_frame.load()
+        r, g, b = px[min(cx, self.preview_frame.width - 1), min(cy, self.preview_frame.height - 1)]
+        self.remover.set_target((r, g, b))
+        self.lbl_status.text = f"Color picked: RGB=({r},{g},{b})"
 
     def _preview(self, btn):
         if self.preview_frame is None:
-            self.lbl_status.text = "请先加载视频"
+            self.lbl_status.text = "Load a video first"
             return
-        if self.remover.target_hsv is None or self.remover.roi is None:
-            self.lbl_status.text = "请先框选并取色"
+        if self.remover.target_rgb is None or self.remover.roi is None:
+            self.lbl_status.text = "Draw ROI and pick color first"
             return
         result = self.remover.remove(self.preview_frame)
         self.last_result = result
         self.video.set_frame(result)
-        self.lbl_status.text = "预览完成"
+        self.lbl_status.text = "Preview done"
 
     def _start_process(self, btn):
-        if self.cap is None or not self.cap.isOpened():
-            self.lbl_status.text = "请先加载视频"
+        if self.video_path is None:
+            self.lbl_status.text = "Load a video first"
             return
-        if self.remover.target_hsv is None:
-            self.lbl_status.text = "请先取色"
+        if self.remover.target_rgb is None:
+            self.lbl_status.text = "Pick color first"
             return
         if self.is_playing:
             self._stop_play()
         self._process_cancel.clear()
-        self.btn_process.text = "停止"
+        self.btn_process.text = "Stop"
         self.btn_process.unbind(on_press=self._start_process)
         self.btn_process.bind(on_press=self._stop_process)
-        self.lbl_status.text = "处理中..."
+        self.lbl_status.text = "Processing..."
         self._process_thread = Thread(target=self._process_worker, daemon=True)
         self._process_thread.start()
 
     def _stop_process(self, btn):
         self._process_cancel.set()
-        self.btn_process.text = "处理"
+        self.btn_process.text = "Process"
         self.btn_process.unbind(on_press=self._stop_process)
         self.btn_process.bind(on_press=self._start_process)
 
     def _process_worker(self):
         try:
-            cap = cv2.VideoCapture(self.video_path)
-            if not cap.isOpened():
-                Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", "无法重新打开视频"))
-                return
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out_dir = os.path.dirname(self.video_path) or "."
-            out_name = os.path.splitext(os.path.basename(self.video_path))[0] + "_无反色.mp4"
-            out_path = os.path.join(out_dir, out_name)
-            writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-            if not writer.isOpened():
-                Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", "无法创建输出视频"))
-                cap.release()
-                return
-            idx = 0
-            while not self._process_cancel.is_set():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                repaired = self.remover.remove(frame)
-                writer.write(repaired)
-                idx += 1
-                if idx % 10 == 0:
-                    prog = f"处理中: {idx}/{total}"
-                    Clock.schedule_once(lambda dt, p=prog: setattr(self.lbl_status, "text", p))
-            cap.release()
-            writer.release()
-            if self._process_cancel.is_set():
-                try:
-                    os.remove(out_path)
-                except Exception:
-                    pass
-                Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", "已取消处理"))
+            if ANDROID:
+                self._process_worker_android()
             else:
-                Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", f"完成 → {out_name}"))
+                self._process_worker_pil()
         except Exception as e:
             import traceback
+            Clock.schedule_once(lambda dt, err=str(e): setattr(self.lbl_status, "text", f"Error: {err}"))
             try:
                 log_path = os.path.join(os.environ.get("EXTERNAL_STORAGE", "/sdcard"), "zuuixin_crash.log")
                 with open(log_path, "w", encoding="utf-8") as f:
                     traceback.print_exc(file=f)
             except Exception:
                 pass
-            Clock.schedule_once(lambda dt, err=str(e): setattr(self.lbl_status, "text", f"错误: {err}"))
         finally:
             Clock.schedule_once(lambda dt: self._reset_process_btn())
 
+    def _process_worker_pil(self):
+        from PIL import ImageSequence
+        img = Image.open(self.video_path)
+        fps = getattr(img, "info", {}).get("fps", 10)
+        total = getattr(img, "n_frames", 1)
+        w, h = img.size
+        out_path = os.path.splitext(self.video_path)[0] + "_clean.gif"
+        frames_out = []
+        idx = 0
+        for frame in ImageSequence.Iterator(img):
+            if self._process_cancel.is_set():
+                break
+            rgb = frame.convert("RGB")
+            result = self.remover.remove(rgb)
+            frames_out.append(result)
+            idx += 1
+            if idx % 5 == 0:
+                prog = f"Processing: {idx}/{total}"
+                Clock.schedule_once(lambda dt, p=prog: setattr(self.lbl_status, "text", p))
+        if not self._process_cancel.is_set() and frames_out:
+            frames_out[0].save(out_path, save_all=True, append_images=frames_out[1:], fps=int(fps), loop=0)
+            Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", f"Done -> {os.path.basename(out_path)}"))
+        elif self._process_cancel.is_set():
+            Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", "Cancelled"))
+
+    def _process_worker_android(self):
+        try:
+            mmr = MediaMetadataRetriever()
+            mmr.setDataSource(self.video_path)
+            out_path = os.path.join(os.environ.get("EXTERNAL_STORAGE", "/sdcard"), "output_clean.mp4")
+            mime = mmr.extractMetadata(0) or "video/mp4"
+            fmt = MediaFormat.createVideoFormat(mime, self.video_width, self.video_height)
+            fmt.setInteger(2, 19)
+            fmt.setInteger(1, self.video_width)
+            fmt.setInteger(4, self.video_height)
+            codec = MediaCodec.createEncoderByType(mime)
+            codec.configure(fmt, None, None, 1)
+            codec.start()
+            muxer = MediaMuxer(out_path, 0)
+            muxer_started = False
+            input_done = False
+            output_done = False
+            total = max(1, int(self.video_duration_us / 33333))
+            idx = 0
+            while not (input_done and output_done):
+                if self._process_cancel.is_set():
+                    break
+                if not input_done:
+                    in_idx = codec.dequeueInputBuffer(10000)
+                    if in_idx >= 0:
+                        time_us = int(idx * 33333)
+                        if time_us >= self.video_duration_us:
+                            codec.queueInputBuffer(in_idx, 0, 0, 0, 4)
+                            input_done = True
+                        else:
+                            bitmap = mmr.getFrameAtTime(time_us, 0)
+                            if bitmap:
+                                pil_frame = android_bitmap_to_pil(bitmap)
+                                result = self.remover.remove(pil_frame)
+                                result_rgb = result.convert("RGB")
+                                w, h = result_rgb.size
+                                pixels = list(result_rgb.getdata())
+                                buf = bytearray(w * h * 3)
+                                i = 0
+                                for r, g, b in pixels:
+                                    buf[i] = r
+                                    buf[i + 1] = g
+                                    buf[i + 2] = b
+                                    i += 3
+                                codec.queueInputBuffer(in_idx, 0, len(buf), time_us, 0)
+                                bitmap.recycle()
+                            else:
+                                codec.queueInputBuffer(in_idx, 0, 0, time_us, 0)
+                        idx += 1
+                        if idx % 10 == 0:
+                            prog = f"Processing: {idx}/{total}"
+                            Clock.schedule_once(lambda dt, p=prog: setattr(self.lbl_status, "text", p))
+                buf_info = MediaCodec.BufferInfo()
+                out_idx = codec.dequeueOutputBuffer(buf_info, 10000)
+                if out_idx >= 0:
+                    out_buf = codec.getOutputBuffer(out_idx)
+                    if buf_info.size > 0 and (buf_info.flags & 2) == 0:
+                        if not muxer_started:
+                            muxer.addTrack(fmt)
+                            muxer.start()
+                            muxer_started = True
+                        muxer.writeSampleData(0, out_buf, buf_info)
+                    codec.releaseOutputBuffer(out_idx, False)
+                    if buf_info.flags & 4:
+                        output_done = True
+            codec.stop()
+            codec.release()
+            if not self._process_cancel.is_set():
+                if not muxer_started:
+                    muxer.addTrack(fmt)
+                    muxer.start()
+                muxer.stop()
+                muxer.release()
+                Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", f"Done -> {os.path.basename(out_path)}"))
+            else:
+                Clock.schedule_once(lambda dt: setattr(self.lbl_status, "text", "Cancelled"))
+            mmr.release()
+        except Exception as e:
+            Clock.schedule_once(lambda dt, err=str(e): setattr(self.lbl_status, "text", f"Error: {err}"))
+
     def _reset_process_btn(self):
-        self.btn_process.text = "处理"
+        self.btn_process.text = "Process"
         self.btn_process.unbind(on_press=self._stop_process)
         self.btn_process.bind(on_press=self._start_process)
 
-    # --- playback ---
     def _toggle_play(self, btn):
-        if self.cap is None:
+        if self.video_path is None:
             return
         if self.is_playing:
             self._stop_play()
@@ -631,63 +736,65 @@ class MainApp(App):
 
     def _start_play(self):
         self.is_playing = True
-        self.btn_play.text = "⏸"
+        self.btn_play.text = "Pause"
         self._play_event = Clock.schedule_interval(self._play_tick, 1.0 / self.fps)
 
     def _stop_play(self):
         self.is_playing = False
-        self.btn_play.text = "▶"
+        self.btn_play.text = "Play"
         if self._play_event:
             self._play_event.cancel()
             self._play_event = None
 
     def _play_tick(self, dt):
-        if self.cap and self.cap.isOpened():
-            if not self.is_seeking:
-                ret, frame = self.cap.read()
-                if ret:
-                    self.preview_frame = frame
-                    self.last_result = None
-                    self.video.set_frame(frame)
-                    pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-                    self.seek_slider.value = min(pos, self.total_frames - 1)
-                    self._update_time()
-                else:
-                    self._stop_play()
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-    def _prev_frame(self, btn):
-        if self.cap and self.cap.isOpened():
-            pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            target = max(0, pos - 2)
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            ret, frame = self.cap.read()
-            if ret:
+        if self.video_path is None:
+            return
+        if not self.is_seeking:
+            self.current_frame_idx += 1
+            if self.current_frame_idx >= self.total_frames:
+                self.current_frame_idx = 0
+            frame = self._get_frame(self.current_frame_idx)
+            if frame:
                 self.preview_frame = frame
                 self.last_result = None
                 self.video.set_frame(frame)
-                self.seek_slider.value = target
+                self.seek_slider.value = self.current_frame_idx
                 self._update_time()
 
-    def _on_seek_drag(self, inst, val):
-        if self.cap and self.cap.isOpened():
-            target = int(val)
-            self.is_seeking = True
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            ret, frame = self.cap.read()
-            if ret:
-                self.preview_frame = frame
-                self.last_result = None
-                self.video.set_frame(frame)
+    def _prev_frame(self, btn):
+        if self.video_path is None:
+            return
+        self.current_frame_idx = max(0, self.current_frame_idx - 1)
+        frame = self._get_frame(self.current_frame_idx)
+        if frame:
+            self.preview_frame = frame
+            self.last_result = None
+            self.video.set_frame(frame)
+            self.seek_slider.value = self.current_frame_idx
             self._update_time()
-            self.is_seeking = False
+
+    def _on_seek_drag(self, inst, val):
+        if self.video_path is None:
+            return
+        target = int(val)
+        self.is_seeking = True
+        self.current_frame_idx = target
+        frame = self._get_frame(target)
+        if frame:
+            self.preview_frame = frame
+            self.last_result = None
+            self.video.set_frame(frame)
+        self._update_time()
+        self.is_seeking = False
 
     def _update_time(self):
-        if self.cap and self.fps > 0:
-            pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            cur = f"{pos // 60 // 60:02d}:{pos // 60 % 60:02d}:{pos % 60:02d}" if self.total_frames > 3600 else f"{pos // 60:02d}:{pos % 60:02d}"
-            total = f"{self.total_frames // 60 // 60:02d}:{self.total_frames // 60 % 60:02d}:{self.total_frames % 60:02d}" if self.total_frames > 3600 else f"{self.total_frames // 60:02d}:{self.total_frames % 60:02d}"
-            self.lbl_time.text = f"{cur} / {total}"
+        if self.video_path and self.fps > 0:
+            pos = self.current_frame_idx
+            cur_s = pos / self.fps
+            tot_s = self.total_frames / self.fps
+            cur = f"{int(cur_s)//60:02d}:{int(cur_s)%60:02d}"
+            tot = f"{int(tot_s)//60:02d}:{int(tot_s)%60:02d}"
+            self.lbl_time.text = f"{cur} / {tot}"
 
 
 if __name__ == "__main__":
